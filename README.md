@@ -1,4 +1,4 @@
-# Metadatarr
+Metadatarr
 ===========
 
 Metadatarr is a Python script that renames movie directories and updates your Radarr library by to maximize on Plex's {edition-...} feature by appending a custom edition string to each movie’s folder name. The edition string is built using data available directly from the Radarr API (such as quality and ratings) and is formatted as a token in curly braces (e.g. {edition-4.4 - 720p}). Any pre-existing edition block is overwritten.
