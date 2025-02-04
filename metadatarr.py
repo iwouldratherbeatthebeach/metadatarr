@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""
+Metadatarr Interactive
+
+This script interacts with your Radarr library to either:
+  1. Add/Update a custom {edition-...} block to each movie’s folder name based on data from the Radarr API,
+     or
+  2. Remove any existing {edition-...} block from the movie folder names (reverting them to their base names).
+
+It renames the physical directories on disk and updates the Radarr record's folderName and path fields (using the new absolute folder path).
+
+If no changes are needed, the script will skip the update and refresh for that movie. A progress counter is shown (X/Total).
+Note: If Radarr’s auto-renaming is enabled, it may override your external changes—consider disabling or adjusting the auto-renaming settings.
+"""
 
 import os
 import re
@@ -13,7 +26,7 @@ import base64
 # CONFIGURATION
 ######################
 
-LOG_LEVEL = logging.INFO  # Set to logging.DEBUG for more detailed output
+LOG_LEVEL = logging.INFO  # Set to logging.DEBUG for more verbose output
 
 # Ensure stdout uses UTF-8 (for Windows Python 3.7+)
 if hasattr(sys.stdout, "reconfigure"):
@@ -37,7 +50,7 @@ def safe_log(message, level=logging.INFO):
 RADARR_URL = "http://localhost:7878"  # Update if needed
 RADARR_API_KEY = "<YOUR_RADARR_API_KEY>"  # Replace with your actual API key
 
-# For this version, we use only the X-Api-Key header (Basic Auth disabled)
+# Use only the X-Api-Key header (Basic Auth disabled)
 USE_BASIC_AUTH = False
 
 # Choose which rating to use from the Radarr record.
@@ -72,6 +85,7 @@ QUALITY_MAPPING = {
     "HDTV-480p": "480p",
     "HDTV-720p": "720p",
     "HDTV-1080p": "1080p",
+    "Bluray-576p": "576p",
     "Bluray-720p": "720p",
     "Bluray-1080p": "1080p",
     "WEBRip-480p": "480p",
@@ -99,7 +113,6 @@ QUALITY_MAPPING = {
     "VHSRip": "VHS"
 }
 
-# Order of metadata parts for the edition string.
 METADATA_ORDER = ["rating", "resolution", "codec", "language"]
 
 ######################
@@ -124,6 +137,17 @@ def get_radarr_movies():
     response = requests.get(RADARR_MOVIE_ENDPOINT, headers=headers, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     safe_log("Retrieved movies from Radarr.", logging.DEBUG)
+    return response.json()
+
+def refresh_and_get_movie(movie_id):
+    """Trigger a refresh for the movie and retrieve its updated record."""
+    trigger_refresh_movie(movie_id)
+    safe_log(f"Waiting for refresh to complete for movie id {movie_id}...", logging.DEBUG)
+    time.sleep(5)  # Adjust the delay as needed
+    headers = get_headers()
+    response = requests.get(f"{RADARR_MOVIE_ENDPOINT}/{movie_id}", headers=headers, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    safe_log(f"Retrieved updated record for movie id {movie_id}.", logging.DEBUG)
     return response.json()
 
 def build_edition_string(movie):
@@ -230,54 +254,88 @@ def rename_physical_directory(old_full_path, new_full_path):
 
 def option_add_edition():
     """
-    For each movie in Radarr, compute a new folder name that includes an edition block
-    based on data from the movie record. The edition block is added (or overwritten) to the folder name.
+    For each movie in Radarr, check if a new edition block is needed.
+    First, compute a candidate new folder name using the current record.
+    If it differs from the current folder name, refresh the record and recalc before updating.
+    A progress counter (X/Total) is displayed.
     """
     safe_log("Starting option: Add/Update edition block...", logging.INFO)
     movies = get_radarr_movies()
-    # Regex to detect an existing edition block in curly braces at the end.
+    total = len(movies)
     edition_pattern = re.compile(r"\s*\{edition-.*\}$", re.IGNORECASE)
-    for movie in movies:
+    for index, movie in enumerate(movies, start=1):
+        title = movie.get("title")
+        safe_log(f"Processing movie {index}/{total}: {title}", logging.INFO)
+
         root = movie.get("rootFolderPath")
         current_folder = movie.get("folderName")
         if not root or not current_folder:
-            safe_log(f"Skipping movie '{movie.get('title')}' due to missing rootFolderPath or folderName.", logging.ERROR)
+            safe_log(f"Skipping movie '{title}' due to missing rootFolderPath or folderName.", logging.ERROR)
             continue
 
-        # Use only the base name if current_folder is absolute.
+        # Work with relative folder name
         if os.path.isabs(current_folder):
             current_folder = os.path.basename(current_folder)
         current_full_path = os.path.join(root, current_folder)
         if not os.path.exists(current_full_path):
             safe_log(f"Old folder path does not exist: {current_full_path}", logging.ERROR)
-            safe_log(f"Skipping movie '{movie.get('title')}'.", logging.ERROR)
+            safe_log(f"Skipping movie '{title}'.", logging.ERROR)
             continue
 
-        # Remove any existing edition block.
+        # Remove any existing edition block
         if edition_pattern.search(current_folder):
             base_folder = edition_pattern.sub("", current_folder).strip()
-            safe_log(f"Removed existing edition block for '{movie.get('title')}'.", logging.DEBUG)
+            safe_log(f"Removed existing edition block for '{title}'.", logging.DEBUG)
         else:
             base_folder = current_folder.strip()
 
-        edition = build_edition_string(movie)
-        if edition:
-            new_rel_folder = f"{base_folder} {{edition-{edition}}}"
+        # Build candidate edition string from current record
+        candidate_edition = build_edition_string(movie)
+        if candidate_edition:
+            candidate_new_folder = f"{base_folder} {{edition-{candidate_edition}}}"
+        else:
+            candidate_new_folder = base_folder
+
+        # If no change, skip update
+        if candidate_new_folder == current_folder:
+            safe_log(f"[SKIP] No folder name change needed for '{title}'", logging.INFO)
+            continue
+
+        # Refresh movie record to capture any recent file changes
+        try:
+            movie = refresh_and_get_movie(movie.get("id"))
+        except Exception as e:
+            safe_log(f"Failed to refresh movie '{title}': {e}", logging.ERROR)
+            continue
+
+        # Recalculate base folder from refreshed record
+        updated_folder = movie.get("folderName")
+        if os.path.isabs(updated_folder):
+            updated_folder = os.path.basename(updated_folder)
+        if edition_pattern.search(updated_folder):
+            base_folder = edition_pattern.sub("", updated_folder).strip()
+        else:
+            base_folder = updated_folder.strip()
+
+        updated_edition = build_edition_string(movie)
+        if updated_edition:
+            new_rel_folder = f"{base_folder} {{edition-{updated_edition}}}"
         else:
             new_rel_folder = base_folder
 
-        if new_rel_folder == current_folder:
-            safe_log(f"[SKIP] No folder name change needed for '{movie.get('title')}'", logging.INFO)
+        # If the updated new folder equals the current one, skip update
+        if new_rel_folder == updated_folder:
+            safe_log(f"[SKIP] No folder name change needed for '{title}' after refresh", logging.INFO)
             continue
 
         new_full_path = os.path.join(root, new_rel_folder)
-        safe_log(f"[UPDATE] '{movie.get('title')}'", logging.INFO)
+        safe_log(f"[UPDATE] '{title}'", logging.INFO)
         safe_log(f"  Current folder: {current_full_path}", logging.INFO)
         safe_log(f"  New folder:     {new_full_path}", logging.INFO)
 
         renamed = rename_physical_directory(current_full_path, new_full_path)
         if not renamed and FORCE_RADARR_UPDATE_ON_RENAME_FAILURE:
-            safe_log(f"Physical rename failed but forcing Radarr update for '{movie.get('title')}'.", logging.WARNING)
+            safe_log(f"Physical rename failed but forcing Radarr update for '{title}'.", logging.WARNING)
             renamed = True
 
         if renamed:
@@ -285,9 +343,9 @@ def option_add_edition():
                 update_movie_folder(movie, new_full_path)
                 trigger_refresh_movie(movie.get("id"))
             except Exception as e:
-                safe_log(f"Error updating Radarr record for '{movie.get('title')}': {e}", logging.ERROR)
+                safe_log(f"Error updating Radarr record for '{title}': {e}", logging.ERROR)
         else:
-            safe_log(f"Skipping Radarr record update for '{movie.get('title')}' due to folder rename failure.", logging.ERROR)
+            safe_log(f"Skipping Radarr record update for '{title}' due to folder rename failure.", logging.ERROR)
         
         time.sleep(0.5)
 
@@ -295,52 +353,59 @@ def option_remove_edition():
     """
     For each movie in Radarr, if an edition block exists in the folder name,
     remove it and update the movie record and physical folder accordingly.
+    A progress counter (X/Total) is displayed.
     """
     safe_log("Starting option: Remove edition block...", logging.INFO)
     movies = get_radarr_movies()
-    # Regex to detect an edition block in curly braces at the end.
+    total = len(movies)
     edition_pattern = re.compile(r"\s*\{edition-.*\}$", re.IGNORECASE)
-    for movie in movies:
+    for index, movie in enumerate(movies, start=1):
+        title = movie.get("title")
+        safe_log(f"Processing movie {index}/{total}: {title}", logging.INFO)
+        movie_id = movie.get("id")
+        try:
+            movie = refresh_and_get_movie(movie_id)
+        except Exception as e:
+            safe_log(f"Failed to refresh movie '{title}': {e}", logging.ERROR)
+            continue
+
         root = movie.get("rootFolderPath")
         current_folder = movie.get("folderName")
         if not root or not current_folder:
-            safe_log(f"Skipping movie '{movie.get('title')}' due to missing rootFolderPath or folderName.", logging.ERROR)
+            safe_log(f"Skipping movie '{title}' due to missing rootFolderPath or folderName.", logging.ERROR)
             continue
 
-        # Use only the base name if necessary.
         if os.path.isabs(current_folder):
             current_folder = os.path.basename(current_folder)
         current_full_path = os.path.join(root, current_folder)
         if not os.path.exists(current_full_path):
             safe_log(f"Old folder path does not exist: {current_full_path}", logging.ERROR)
-            safe_log(f"Skipping movie '{movie.get('title')}'.", logging.ERROR)
+            safe_log(f"Skipping movie '{title}'", logging.ERROR)
             continue
 
-        # Check if an edition block exists.
         if not edition_pattern.search(current_folder):
-            safe_log(f"No edition block found for '{movie.get('title')}', skipping.", logging.INFO)
+            safe_log(f"No edition block found for '{title}', skipping.", logging.INFO)
             continue
 
-        # Remove the edition block.
         new_rel_folder = edition_pattern.sub("", current_folder).strip()
         new_full_path = os.path.join(root, new_rel_folder)
-        safe_log(f"[UPDATE] '{movie.get('title')}'", logging.INFO)
+        safe_log(f"[UPDATE] '{title}'", logging.INFO)
         safe_log(f"  Current folder: {current_full_path}", logging.INFO)
         safe_log(f"  New folder:     {new_full_path}", logging.INFO)
 
         renamed = rename_physical_directory(current_full_path, new_full_path)
         if not renamed and FORCE_RADARR_UPDATE_ON_RENAME_FAILURE:
-            safe_log(f"Physical rename failed but forcing Radarr update for '{movie.get('title')}'.", logging.WARNING)
+            safe_log(f"Physical rename failed but forcing Radarr update for '{title}'.", logging.WARNING)
             renamed = True
 
         if renamed:
             try:
                 update_movie_folder(movie, new_full_path)
-                trigger_refresh_movie(movie.get("id"))
+                trigger_refresh_movie(movie_id)
             except Exception as e:
-                safe_log(f"Error updating Radarr record for '{movie.get('title')}': {e}", logging.ERROR)
+                safe_log(f"Error updating Radarr record for '{title}': {e}", logging.ERROR)
         else:
-            safe_log(f"Skipping Radarr record update for '{movie.get('title')}' due to folder rename failure.", logging.ERROR)
+            safe_log(f"Skipping Radarr record update for '{title}' due to folder rename failure.", logging.ERROR)
         
         time.sleep(0.5)
 
