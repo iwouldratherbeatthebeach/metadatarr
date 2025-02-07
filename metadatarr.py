@@ -10,7 +10,8 @@ This script interacts with your Radarr library to either:
 It renames the physical directories on disk and updates the Radarr record’s folderName and path fields
 (with the new absolute folder path).
 
-If no changes are needed—or if the physical folder does not exist or the new folder already exists—the script skips that movie.
+If no changes are needed—or if the physical folder is missing or if the candidate edition (excluding codec)
+is identical to the current edition—the script skips that movie.
 A progress counter (X/Total) is displayed.
 Note: If Radarr’s auto‑renaming is enabled, it may override external changes—consider disabling or adjusting those settings.
 """
@@ -28,7 +29,7 @@ import base64
 # CONFIGURATION
 ######################
 
-LOG_LEVEL = logging.INFO  # Change to logging.DEBUG for more details
+LOG_LEVEL = logging.INFO  # Change to logging.DEBUG for more detailed output
 
 # Ensure stdout uses UTF-8 (for Windows Python 3.7+)
 if hasattr(sys.stdout, "reconfigure"):
@@ -85,13 +86,14 @@ QUALITY_MAPPING = {
     "DVD-576p": "576p",
     "DVD": "DVD",
     # Standard Definition (SD)
-    "SDTV": "SDTV",
+    "SDTV": "480p",
     "TVRip": "TVRip",
     # High Definition (HD)
     "HDTV-480p": "480p",
     "HDTV-720p": "720p",
     "HDTV-1080p": "1080p",
-    "Bluray-576p": "576p",   # New entry for Bluray-576p
+    "Bluray-480p": "480p",
+    "Bluray-576p": "576p",
     "Bluray-720p": "720p",
     "Bluray-1080p": "1080p",
     "WEBRip-480p": "480p",
@@ -124,7 +126,22 @@ QUALITY_MAPPING = {
     "VHSRip": "VHS"
 }
 
+# The candidate edition string is built in the order defined by METADATA_ORDER.
 METADATA_ORDER = ["rating", "resolution", "codec", "language"]
+
+def get_enabled_fields():
+    fields = []
+    if INCLUDE_RATINGS and (SHOW_CRITIC_RATING or SHOW_AUDIENCE_RATING):
+        fields.append("rating")
+    if SHOW_RESOLUTION:
+        fields.append("resolution")
+    if SHOW_CODEC:
+        fields.append("codec")
+    if SHOW_LANGUAGE:
+        fields.append("language")
+    return fields
+
+EXPECTED_PARTS_COUNT = len(get_enabled_fields())
 
 # Configurable sleep times (in seconds)
 FAST_MODE_SLEEP = 0.5   # Delay between movies in fast mode
@@ -166,10 +183,20 @@ def refresh_and_get_movie(movie_id):
     safe_log(f"Retrieved updated record for movie id {movie_id}.", logging.DEBUG)
     return response.json()
 
+def normalize_codec(codec_str):
+    """Normalize codec values so that x264 and h264 (and x265/h265) are treated as equivalent."""
+    cs = codec_str.lower().strip()
+    if cs in ["x264", "h264"]:
+        return "h264"
+    if cs in ["x265", "h265"]:
+        return "h265"
+    return cs
+
 def build_edition_string(movie):
     """
     Build the edition string using data from the Radarr movie record.
     Uses movieFile.quality for resolution and the movie.ratings object for rating.
+    The codec field is normalized.
     """
     metadata_parts = {}
     movie_file = movie.get("movieFile", {})
@@ -186,8 +213,9 @@ def build_edition_string(movie):
     if SHOW_CODEC:
         codec = movie_file.get("mediaInfo", {}).get("videoCodec")
         if codec:
-            metadata_parts["codec"] = codec
-            safe_log(f"Codec: {codec}", logging.DEBUG)
+            normalized = normalize_codec(codec)
+            metadata_parts["codec"] = normalized
+            safe_log(f"Codec: {normalized}", logging.DEBUG)
 
     if SHOW_LANGUAGE:
         language = movie_file.get("language")
@@ -279,11 +307,23 @@ def option_add_edition():
     In fast mode, the script uses the current record without triggering a refresh unless the physical folder is missing.
     A progress counter (X/Total) is displayed.
     If the physical directory is missing, the movie is skipped.
+    Additionally, if an existing edition block is present and the candidate edition (excluding codec) is identical to the current edition,
+    the update is skipped.
     """
     safe_log("Starting option: Add/Update edition block (fast mode)...", logging.INFO)
     movies = get_radarr_movies()
     total = len(movies)
-    edition_pattern = re.compile(r"\s*\{edition-.*\}$", re.IGNORECASE)
+    edition_pattern = re.compile(r"\{edition-(.*)\}$", re.IGNORECASE)
+    enabled_fields = []
+    if INCLUDE_RATINGS and (SHOW_CRITIC_RATING or SHOW_AUDIENCE_RATING):
+        enabled_fields.append("rating")
+    if SHOW_RESOLUTION:
+        enabled_fields.append("resolution")
+    if SHOW_CODEC:
+        enabled_fields.append("codec")
+    if SHOW_LANGUAGE:
+        enabled_fields.append("language")
+    
     for index, movie in enumerate(movies, start=1):
         title = movie.get("title")
         safe_log(f"Processing movie {index}/{total}: {title}", logging.INFO)
@@ -298,12 +338,17 @@ def option_add_edition():
         if os.path.isabs(current_folder):
             current_folder = os.path.basename(current_folder)
         current_full_path = os.path.join(root, current_folder)
-        # If the physical folder is missing, skip the movie.
+        # Skip movie if the physical folder is missing.
         if not os.path.exists(current_full_path):
             safe_log(f"Physical folder missing: {current_full_path}. Skipping movie '{title}'.", logging.ERROR)
             continue
 
-        if edition_pattern.search(current_folder):
+        # Check for an existing edition block.
+        current_parts = []
+        m = edition_pattern.search(current_folder)
+        if m:
+            current_edition = m.group(1).strip()
+            current_parts = [p.strip() for p in current_edition.split(" - ")]
             base_folder = edition_pattern.sub("", current_folder).strip()
             safe_log(f"Removed existing edition block for '{title}'.", logging.DEBUG)
         else:
@@ -311,9 +356,25 @@ def option_add_edition():
 
         candidate_edition = build_edition_string(movie)
         if candidate_edition:
+            candidate_parts = [p.strip() for p in candidate_edition.split(" - ")]
             candidate_folder = f"{base_folder} {{edition-{candidate_edition}}}"
         else:
             candidate_folder = base_folder
+            candidate_parts = []
+
+        # Compare non-codec fields if an edition block exists.
+        if current_parts and candidate_parts:
+            non_codec_same = True
+            for field, cur, cand in zip(enabled_fields, current_parts, candidate_parts):
+                if field == "codec":
+                    # Skip codec comparison.
+                    continue
+                if cur.lower() != cand.lower():
+                    non_codec_same = False
+                    break
+            if non_codec_same:
+                safe_log(f"[SKIP] For '{title}': Non-codec fields unchanged. Skipping update.", logging.INFO)
+                continue
 
         if candidate_folder == current_folder:
             safe_log(f"[SKIP] No folder name change needed for '{title}'", logging.INFO)
